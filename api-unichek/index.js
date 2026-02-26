@@ -19,7 +19,8 @@ const dbConfig = {
 app.get('/admin/turmas', async (req, res) => {
     try {
         let pool = await sql.connect(dbConfig);
-        let result = await pool.request().query("SELECT id, nome_turma, periodo FROM Turmas");
+        // Ordena por nome da turma alfabeticamente
+        let result = await pool.request().query("SELECT id, nome_turma, periodo FROM Turmas ORDER BY nome_turma ASC");
         res.json({ success: true, lista: result.recordset });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
@@ -40,13 +41,13 @@ app.post('/admin/turmas', async (req, res) => {
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
-// EDITAR CLASSE INTEIRA (Ajustada)
 app.put('/admin/turmas/GRUPO/editar', async (req, res) => {
     const { nomeAntigo, nome_turma, semestres, periodo } = req.body; 
     try {
         let pool = await sql.connect(dbConfig);
         
-        // 1. Atualiza nomes existentes
+        // 1. Atualiza nomes e períodos APENAS do grupo e turno específicos
+        // Mudamos o LIKE para ser exato no prefixo e filtrar pelo período antigo
         await pool.request()
             .input('antigoBusca', sql.VarChar, `${nomeAntigo}%`)
             .input('antigoPuro', sql.VarChar, nomeAntigo)
@@ -56,18 +57,20 @@ app.put('/admin/turmas/GRUPO/editar', async (req, res) => {
                 UPDATE Turmas 
                 SET nome_turma = REPLACE(nome_turma, @antigoPuro, @novoNome),
                     periodo = @per
-                WHERE nome_turma LIKE @antigoBusca
+                WHERE nome_turma LIKE @antigoBusca AND periodo = @per
             `);
 
-        // 2. Ajuste de quantidade
+        // 2. Ajuste de quantidade específico para esse grupo e turno
         const atuais = await pool.request()
             .input('base', sql.VarChar, `${nome_turma}%`)
-            .query("SELECT * FROM Turmas WHERE nome_turma LIKE @base ORDER BY id ASC");
+            .input('per', sql.VarChar, periodo)
+            .query("SELECT * FROM Turmas WHERE nome_turma LIKE @base AND periodo = @per ORDER BY id ASC");
 
         const qtdAtual = atuais.recordset.length;
         const novaQtd = parseInt(semestres);
 
         if (novaQtd > qtdAtual) {
+            // Adiciona o que falta
             for (let i = qtdAtual + 1; i <= novaQtd; i++) {
                 await pool.request()
                     .input('n', sql.VarChar, `${nome_turma} - ${i}° Período`)
@@ -75,53 +78,63 @@ app.put('/admin/turmas/GRUPO/editar', async (req, res) => {
                     .query("INSERT INTO Turmas (nome_turma, periodo) VALUES (@n, @p)");
             }
         } else if (novaQtd < qtdAtual) {
+            // Remove apenas os excedentes DESTE turno
             const IDsParaRemover = atuais.recordset.slice(novaQtd).map(t => t.id);
             for (let id of IDsParaRemover) {
                 await pool.request().input('id', sql.Int, id).query("DELETE FROM Turmas WHERE id = @id");
             }
         }
-        res.json({ success: true, message: "Classe atualizada!" });
-    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
-});
-
-// DELETE CLASSE INTEIRA (Blindada contra erro de FK)
-app.post('/admin/turmas/GRUPO/deletar', async (req, res) => {
-    const { nomeBase } = req.body;
-    try {
-        let pool = await sql.connect(dbConfig);
-        
-        // 1. "Solta" os usuários: quem estiver vinculado a turmas desse curso fica com id_turma = NULL
-        // Usamos uma subquery para achar todos os IDs de turmas que começam com o nome da classe
-        await pool.request()
-            .input('base', sql.VarChar, `${nomeBase}%`)
-            .query(`
-                UPDATE Usuarios 
-                SET id_turma = NULL 
-                WHERE id_turma IN (SELECT id FROM Turmas WHERE nome_turma LIKE @base)
-            `);
-
-        // 2. Apaga vínculos de professores na tabela de relação
-        // Isso resolve o erro de conflito que restava
-        await pool.request()
-            .input('base', sql.VarChar, `${nomeBase}%`)
-            .query(`
-                DELETE FROM Professor_Turmas 
-                WHERE id_turma IN (SELECT id FROM Turmas WHERE nome_turma LIKE @base)
-            `);
-
-        // 3. Agora, com a casa limpa, apaga as turmas de fato
-        await pool.request()
-            .input('base', sql.VarChar, `${nomeBase}%`)
-            .query("DELETE FROM Turmas WHERE nome_turma LIKE @base");
-        
-        res.json({ success: true, message: "Classe e vínculos removidos com sucesso!" });
-    } catch (err) {
-        console.error("Erro fatal ao deletar classe:", err.message);
-        res.status(500).json({ success: false, message: "Não foi possível excluir. Verifique se existem dependências ativas." });
+        res.json({ success: true, message: "Classe atualizada com sucesso!" });
+    } catch (err) { 
+        res.status(500).json({ success: false, message: err.message }); 
     }
 });
 
-// EDIÇÃO INDIVIDUAL DE TURMA
+app.post('/admin/turmas/GRUPO/deletar', async (req, res) => {
+    // Agora recebemos também o período (turno) para não apagar o curso de outro horário
+    const { nomeBase, periodo } = req.body; 
+    
+    try {
+        let pool = await sql.connect(dbConfig);
+        
+        // 1. "Solta" os usuários APENAS das turmas daquele nome e daquele período
+        await pool.request()
+            .input('base', sql.VarChar, `${nomeBase}%`)
+            .input('per', sql.VarChar, periodo)
+            .query(`
+                UPDATE Usuarios 
+                SET id_turma = NULL 
+                WHERE id_turma IN (
+                    SELECT id FROM Turmas 
+                    WHERE nome_turma LIKE @base AND periodo = @per
+                )
+            `);
+
+        // 2. Apaga vínculos de professores APENAS daquele grupo e turno
+        await pool.request()
+            .input('base', sql.VarChar, `${nomeBase}%`)
+            .input('per', sql.VarChar, periodo)
+            .query(`
+                DELETE FROM Professor_Turmas 
+                WHERE id_turma IN (
+                    SELECT id FROM Turmas 
+                    WHERE nome_turma LIKE @base AND periodo = @per
+                )
+            `);
+
+        // 3. Agora apaga as turmas específicas do turno com segurança
+        await pool.request()
+            .input('base', sql.VarChar, `${nomeBase}%`)
+            .input('per', sql.VarChar, periodo)
+            .query("DELETE FROM Turmas WHERE nome_turma LIKE @base AND periodo = @per");
+        
+        res.json({ success: true, message: "Classe removida com sucesso (específica para o turno)!" });
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).json({ success: false, message: "Erro ao deletar classe: " + err.message });
+    }
+});
+
 app.put('/admin/turmas/:id', async (req, res) => {
     const { id } = req.params;
     const { nome_turma, periodo } = req.body;
@@ -136,16 +149,12 @@ app.put('/admin/turmas/:id', async (req, res) => {
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
-// EXCLUSÃO INDIVIDUAL DE TURMA
 app.delete('/admin/turmas/:id', async (req, res) => {
     const { id } = req.params;
     try {
         let pool = await sql.connect(dbConfig);
-        // Primeiro coloca o usuário como NULL
         await pool.request().input('id', sql.Int, id).query("UPDATE Usuarios SET id_turma = NULL WHERE id_turma = @id");
-        // Apaga vínculos de professores
         await pool.request().input('id', sql.Int, id).query("DELETE FROM Professor_Turmas WHERE id_turma = @id");
-        // Apaga a turma
         await pool.request().input('id', sql.Int, id).query("DELETE FROM Turmas WHERE id = @id");
         res.json({ success: true });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
@@ -156,8 +165,7 @@ app.delete('/admin/turmas/:id', async (req, res) => {
 app.get('/admin/usuarios', async (req, res) => {
     try {
         let pool = await sql.connect(dbConfig);
-        
-        // 1. Busca todos os usuários e os dados da turma (se for aluno)
+        // Busca base ordenada por Tipo (Admin > Aluno > Professor) e Nome
         let result = await pool.request().query(`
             SELECT 
                 u.id, u.nome, u.ra, u.senha, u.tipo, u.id_turma,
@@ -165,20 +173,18 @@ app.get('/admin/usuarios', async (req, res) => {
                 t.periodo as turno_aluno
             FROM Usuarios u 
             LEFT JOIN Turmas t ON u.id_turma = t.id
+            ORDER BY u.tipo ASC, u.nome ASC
         `);
 
         let listaRaw = result.recordset;
 
-        // 2. Criamos uma nova lista processada
         const listaProcessada = await Promise.all(listaRaw.map(async (u) => {
             if (u.tipo === 'professor') {
-                // Busca as turmas deste professor
                 let resTurmas = await pool.request()
                     .input('userId', sql.Int, u.id)
                     .query("SELECT id_turma FROM Professor_Turmas WHERE id_usuario = @userId");
                 
                 const ids = resTurmas.recordset.map(r => r.id_turma);
-                
                 return {
                     ...u,
                     turmas_ids: ids,
@@ -196,20 +202,17 @@ app.get('/admin/usuarios', async (req, res) => {
         }));
 
         res.json({ success: true, lista: listaProcessada });
-    } catch (err) { 
-        res.status(500).json({ success: false, message: err.message }); 
-    }
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
+
 app.post('/admin/cadastrar', async (req, res) => {
     const { nome, ra, senha, tipo, id_turma, turmas_professor } = req.body;
     try {
         let pool = await sql.connect(dbConfig);
         let transaction = new sql.Transaction(pool);
         await transaction.begin();
-
         try {
             const request = new sql.Request(transaction);
-            // 1. Insere o Usuário e pega o ID gerado
             let result = await request
                 .input('nome', sql.VarChar, nome)
                 .input('ra', sql.VarChar, ra)
@@ -219,59 +222,38 @@ app.post('/admin/cadastrar', async (req, res) => {
                 .query("INSERT INTO Usuarios (nome, ra, senha, tipo, id_turma) OUTPUT INSERTED.id VALUES (@nome, @ra, @senha, @tipo, @id_turma)");
             
             const userId = result.recordset[0].id;
-
-            // 2. Se for Professor, insere os vínculos na tabela Professor_Turmas
-            if (tipo === 'professor' && Array.isArray(turmas_professor) && turmas_professor.length > 0) {
+            if (tipo === 'professor' && Array.isArray(turmas_professor)) {
                 for (let tId of turmas_professor) {
-                    await new sql.Request(transaction)
-                        .input('u', sql.Int, userId)
-                        .input('t', sql.Int, tId)
-                        .query("INSERT INTO Professor_Turmas (id_usuario, id_turma) VALUES (@u, @t)");
+                    await new sql.Request(transaction).input('u', sql.Int, userId).input('t', sql.Int, tId).query("INSERT INTO Professor_Turmas (id_usuario, id_turma) VALUES (@u, @t)");
                 }
             }
-
             await transaction.commit();
-            res.json({ success: true, message: "Cadastrado com sucesso!" });
-        } catch (e) {
-            await transaction.rollback();
-            throw e;
-        }
-    } catch (err) { 
-        console.error(err.message);
-        res.status(500).json({ success: false, message: err.message }); 
-    }
+            res.json({ success: true });
+        } catch (e) { await transaction.rollback(); throw e; }
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
 app.put('/admin/usuarios/:id', async (req, res) => {
     const { id } = req.params;
-    const { nome, ra, senha, tipo, id_turma, turmas_professor } = req.body; // turmas_professor deve ser um array de IDs
+    const { nome, ra, tipo, id_turma, turmas_professor } = req.body;
     try {
         let pool = await sql.connect(dbConfig);
         let transaction = new sql.Transaction(pool);
         await transaction.begin();
         try {
-            const request = new sql.Request(transaction);
-            request.input('id', sql.Int, id)
-                   .input('nome', sql.VarChar, nome)
-                   .input('ra', sql.VarChar, ra)
-                   .input('tipo', sql.VarChar, tipo)
-                   .input('id_turma', sql.Int, tipo === 'aluno' ? id_turma : null);
+            await new sql.Request(transaction)
+                .input('id', sql.Int, id)
+                .input('nome', sql.VarChar, nome)
+                .input('ra', sql.VarChar, ra)
+                .input('tipo', sql.VarChar, tipo)
+                .input('id_turma', sql.Int, tipo === 'aluno' ? id_turma : null)
+                .query("UPDATE Usuarios SET nome=@nome, ra=@ra, tipo=@tipo, id_turma=@id_turma WHERE id=@id");
 
-            // 1. Atualiza Usuário
-            await request.query("UPDATE Usuarios SET nome=@nome, ra=@ra, tipo=@tipo, id_turma=@id_turma WHERE id=@id");
-
-            // 2. Se for Professor, gerencia os vínculos
             if (tipo === 'professor') {
-                // Apaga tudo o que ele tinha
                 await new sql.Request(transaction).input('u', sql.Int, id).query("DELETE FROM Professor_Turmas WHERE id_usuario = @u");
-                
-                // Insere os novos vínculos selecionados no App
-                if (turmas_professor && turmas_professor.length > 0) {
+                if (Array.isArray(turmas_professor)) {
                     for (let tId of turmas_professor) {
-                        await new sql.Request(transaction)
-                            .input('u', sql.Int, id)
-                            .input('t', sql.Int, tId)
-                            .query("INSERT INTO Professor_Turmas (id_usuario, id_turma) VALUES (@u, @t)");
+                        await new sql.Request(transaction).input('u', sql.Int, id).input('t', sql.Int, tId).query("INSERT INTO Professor_Turmas (id_usuario, id_turma) VALUES (@u, @t)");
                     }
                 }
             }
