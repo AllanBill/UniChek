@@ -283,5 +283,41 @@ app.post('/login', async (req, res) => {
     } catch (err) { res.status(500).json({ success: false }); }
 });
 
+app.get('/admin/materias', async (req, res) => {
+    try {
+        let pool = await sql.connect(dbConfig);
+        let result = await pool.request().query(`
+            SELECT 
+                m.id, 
+                m.nome_materia, 
+                u.nome as nome_professor, 
+                u.id as id_professor,
+                t.nome_turma, 
+                t.id as id_turma,
+                t.periodo
+            FROM Materias m
+            LEFT JOIN Usuarios u ON m.id_professor = u.id
+            LEFT JOIN Turmas t ON m.id_turma = t.id
+            ORDER BY m.nome_materia ASC
+        `);
+        res.json({ success: true, lista: result.recordset });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// 2. Cadastrar Matéria
+app.post('/admin/materias', async (req, res) => {
+    const { nome_materia, id_professor, id_turma } = req.body;
+    try {
+        let pool = await sql.connect(dbConfig);
+        await pool.request()
+            .input('nome', sql.VarChar, nome_materia)
+            .input('prof', sql.Int, id_professor)
+            .input('turma', sql.Int, id_turma)
+            .query("INSERT INTO Materias (nome_materia, id_professor, id_turma) VALUES (@nome, @prof, @turma)");
+        res.json({ success: true, message: "Matéria cadastrada!" });
+    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+
 const PORT = 3000;
 app.listen(PORT, '0.0.0.0', () => { console.log(`🚀 Servidor UniCheck ativo na porta ${PORT}`); });
